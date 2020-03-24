@@ -13,8 +13,18 @@
 # limitations under the License.
 # ------------------------------------------------------------------------------
 
-# -------------=== listener build ===-------------
+# Description:
+#   Builds the environment needed to build Avalon shell.
+#
+#  Configuration (build) parameters
+#  - proxy configuration: https_proxy http_proxy ftp_proxy
+#
+# Build:
+#   $ docker build docker -f docker/Dockerfile -t avalon-shell-dev
+#   if behind a proxy, you might want to add also below options
+#   --build-arg https_proxy=$https_proxy --build-arg http_proxy=$http_proxy --build-arg ftp_proxy=$ftp_proxy
 
+# -------------=== build avalon shell image ===-------------
 FROM ubuntu:bionic as base_image
 
 # Ignore timezone prompt in apt
@@ -23,11 +33,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Add necessary packages
 RUN apt-get update \
  && apt-get install -y -q \
-    ca-certificates \
+    software-properties-common \
+    python3-pip \
     python3-toml \
     python3-requests \
     python3-colorlog \
     python3-twisted \
+    git \
  && apt-get -y -q upgrade \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
@@ -35,7 +47,20 @@ RUN apt-get update \
 # Make Python3 default
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# -------------=== openssl build ===-------------
+# Installing solidity compiler
+RUN add-apt-repository ppa:ethereum/ethereum \
+   && apt-get update \
+   && apt-get install solc
+   
+# Install py-solc-x and web3 packages using pip because
+# these are not available in apt repository.
+# Install nose2 for running tests.
+RUN pip3 install --upgrade json-rpc web3 py-solc-x nose2
+
+# Install specific version of solc to support versions <0.6.0
+RUN python3 -m solcx.install v0.5.15
+
+# -------------=== Build openssl_image ===-------------
 
 #Build openssl intermediate docker image
 FROM ubuntu:bionic as openssl_image
@@ -64,20 +89,23 @@ RUN OPENSSL_VER=1.1.1d \
  && make test \
  && make install -j$THREADS
 
-#Build Avalon Listener intermediate docker image
+#Build Avalon Enclave Manager intermediate docker image
 FROM base_image as build_image
 
 RUN apt-get update \
  && apt-get install -y -q \
+    build-essential \
     pkg-config \
     cmake \
     make \
+    git \
     libprotobuf-dev \
+    libssl-dev \
     python3-dev \
-    python3-pip \
     swig \
-    software-properties-common
+    tar
 
+RUN pip3 install --upgrade setuptools
 
 # Copy openssl build artifacts from openssl_image
 COPY --from=openssl_image /usr/local/ssl /usr/local/ssl
@@ -88,24 +116,17 @@ COPY --from=openssl_image /usr/local/lib /usr/local/lib
 RUN ldconfig \
  && ln -s /etc/ssl/certs/* /usr/local/ssl/certs/
 
-# Install setuptools packages using pip because
-# these are not available in apt repository.
-RUN pip3 install --upgrade setuptools
-
-ENV TCF_HOME=/project/avalon
-
 COPY VERSION /project/avalon/
 COPY ./bin /project/avalon/bin
-COPY ./config/tcs_config.toml /project/avalon/config/
 COPY ./common/cpp /project/avalon/common/cpp
 COPY ./common/python /project/avalon/common/python
 COPY ./common/crypto_utils /project/avalon/common/crypto_utils
 COPY ./sdk /project/avalon/sdk
-COPY ./listener /project/avalon/listener
 
 WORKDIR /project/avalon/common/cpp
 
-RUN mkdir -p build \
+RUN echo "Building Avalon Common CPP\n" \
+  && mkdir -p build \
   && cd build \
   && cmake .. -DUNTRUSTED_ONLY=1 \
   && make
@@ -113,47 +134,57 @@ RUN mkdir -p build \
 WORKDIR /project/avalon/common/python
 
 RUN echo "Building Avalon Common Python\n" \
- && make 
+  && make
 
 WORKDIR /project/avalon/common/crypto_utils
 
 RUN echo "Building Avalon Common Crypto Python\n" \
- && make
-
-WORKDIR /project/avalon/sdk
-#install Avalon SDK  package.
-RUN echo "Building Avalon SDK\n" \
- && make 
-
-# Build Avalon Listener module next.
-
-WORKDIR /project/avalon/listener/
-
-RUN echo "Building avalon listener\n" \
   && make
 
-# Build final image and install modules
+WORKDIR /project/avalon/sdk
+
+RUN echo "Building Avalon SDK\n" \
+  && make
+
+# Build Final image and install dependent modules
 FROM base_image as final_image
 
+ARG DISPLAY
+ARG XAUTHORITY
+
+#Environment setup
 ENV TCF_HOME=/project/avalon
+# Set display, replace value with [IP address of host]:0
+ENV DISPLAY=:0
 
-WORKDIR /project/avalon/listener
+WORKDIR /project/avalon/
 
-COPY --from=build_image /project/avalon/listener/listener_config.toml /project/avalon/listener/listener_config.toml
-COPY --from=build_image /project/avalon/config/tcs_config.toml /project/avalon/config/
+COPY ./tools/run_tests.sh /project/avalon/tools/
+COPY ./config/tcs_config.toml /project/avalon/config/
+COPY ./tests /project/avalon/tests
+COPY ./sdk/avalon_sdk/tcf_connector.toml /project/avalon/sdk/avalon_sdk/
+COPY ./examples/apps/ /project/avalon/examples/apps
+COPY ./sdk/avalon_sdk/ethereum/contracts /project/avalon/sdk/avalon_sdk/ethereum/contracts
+COPY ./sdk/avalon_sdk/fabric/methods.json /project/avalon/sdk/avalon_sdk/fabric/
+
 # Copy Python build artifacts
 COPY --from=build_image /project/avalon/common/python/dist/*.whl dist/
 COPY --from=build_image /project/avalon/common/crypto_utils/dist/*.whl dist/
 COPY --from=build_image /project/avalon/sdk/dist/*.whl dist/
-COPY --from=build_image /project/avalon/listener/dist/*.whl dist/
+
+# Copy Scripts
+COPY ./scripts /project/avalon/scripts
+
+# Install fabric python sdk
+RUN pip3 install virtualenv \
+ && pip3 install git+https://github.com/hyperledger/fabric-sdk-py.git
 
 # Installing wheel file requires python3-pip package.
 # But python3-pip package will increase size of final docker image.
 # So remove python3-pip package and dependencies after installing wheel file.
 RUN apt-get update \
  && apt-get install -y -q python3-pip \
- && pip3 install --upgrade json-rpc \
- && echo "Install Common Python, Crypto, Listener and SDK packages\n" \
+ && echo "Install Common Python and SDK packages\n" \
  && pip3 install dist/*.whl \
  && echo "Remove unused packages from image\n" \
  && apt-get autoremove --purge -y -q python3-pip \
