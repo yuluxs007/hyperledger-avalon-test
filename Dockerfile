@@ -162,6 +162,7 @@ ARG MAKECLEAN
 ARG TCF_DEBUG_BUILD
 
 # Environment setup
+ENV SGX_MODE=SIM
 ENV TCF_HOME=/project/avalon
 ENV SGX_SSL=/opt/intel/sgxssl
 ENV SGX_SDK=/opt/intel/sgxsdk
